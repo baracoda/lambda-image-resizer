@@ -79,8 +79,16 @@ This solution enables on-demand image resizing and efficient CDN caching using A
 
 ---
 
+## Filename Conventions
+
+- **Original images:** `<name>_original.<ext>` (e.g., `2345454_original.jpg`)
+- **Resized images:** `<name>_s_<width>_<height>.<ext>` (e.g., `2345454_s_400_70.jpg`)
+- The Lambda will always look for the original image with the `_original` suffix and generate resized images using the `_s_` separator.
+
+---
+
 ## Features
-- Resizes images on-the-fly based on `w` (width) and `h` (height) query parameters
+- Resizes images on-the-fly based on filename pattern (no query params needed)
 - Caches resized images in S3 for future requests
 - Supports `.jpg`, `.jpeg`, `.png`, `.webp`
 - Designed for Lambda@Edge or API Gateway triggers
@@ -106,6 +114,7 @@ All environment variables are configurable to suit your deployment:
 | `S3_PREFIX`      | (Optional) S3 key prefix for all images          | `assets/`                    |
 | `MAX_DIMENSION`  | (Optional) Maximum allowed width/height (int)    | `2000`                       |
 | `EXECUTION_MODE` | (Optional) Set to `local` for local testing, or `live` for production | `local` or `live` |
+| `CLOUDFRONT_URL` | (Optional) The base URL for CloudFront redirects | `https://cdn.domain.com`     |
 
 Set these in your Lambda environment variables or your deployment pipeline.
 
@@ -115,7 +124,7 @@ Set these in your Lambda environment variables or your deployment pipeline.
 
 1. **Clone the repository**
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/baracoda/lambda-image-resizer.git
    cd lambda_image_resizer
    ```
 
@@ -131,6 +140,7 @@ Set these in your Lambda environment variables or your deployment pipeline.
    export S3_PREFIX=assets/
    export MAX_DIMENSION=2000
    export EXECUTION_MODE=local  # Use 'local' for local testing, 'live' for production
+   export CLOUDFRONT_URL=https://cdn.domain.com
    ```
 
 ---
@@ -151,6 +161,7 @@ To test the Lambda image resizer locally:
    ```bash
    export IMAGE_BUCKET=your-s3-bucket-name
    export EXECUTION_MODE=local
+   export CLOUDFRONT_URL=https://cdn.domain.com
    ```
    - You can also set `S3_PREFIX` and `MAX_DIMENSION` as needed.
 
@@ -185,6 +196,7 @@ To test the Lambda image resizer locally:
 - `S3_PREFIX` (optional): S3 key prefix for all images (e.g., `assets/`)
 - `MAX_DIMENSION` (optional): Maximum allowed width/height
 - `EXECUTION_MODE` (optional): Set to `live` for production (default), or `local` for local testing/mocking
+- `CLOUDFRONT_URL` (optional): The base URL for CloudFront redirects
 
 ### 3. IAM Permissions
 - Grant the Lambda function the following S3 permissions:
@@ -209,10 +221,10 @@ To test the Lambda image resizer locally:
 
 Request:
 ```
-GET https://cdn.domain.com/assets/image.jpg?w=100&h=50
+GET https://cdn.domain.com/assets/23/2345454_s_400_70.jpg
 ```
-- If `/assets/image_100_50.jpg` exists in S3, it is returned.
-- If not, the Lambda resizes `/assets/image.jpg` to 100x50, stores it as `/assets/image_100_50.jpg`, and returns it.
+- If `/assets/23/2345454_s_400_70.jpg` exists in S3, it is returned.
+- If not, the Lambda resizes `/assets/23/2345454_original.jpg` to 400x70, stores it as `/assets/23/2345454_s_400_70.jpg`, and returns a 301 redirect to the CloudFront URL.
 
 ---
 
@@ -223,7 +235,7 @@ Here are some example error responses you may receive from the Lambda function:
 ### 1. Missing Original Image
 ```
 {
-  "error": "Original image not found. Please upload the _original image.",
+  "error": "Original image not found. Please upload the original image.",
   "errorType": "NotFound"
 }
 ```
@@ -264,11 +276,6 @@ All error responses are returned with `Content-Type: application/json` and an ap
 
 ---
 
-## License
-MIT 
-
----
-
 ## Deployment Best Practices: Excluding Test Dependencies
 
 **Important:**
@@ -304,47 +311,5 @@ MIT
 
 ---
 
-## Filename Conventions
-
-- **Original images:** `<name>_original.<ext>` (e.g., `2345454_original.jpg`)
-- **Resized images:** `<name>_s_<width>_<height>.<ext>` (e.g., `2345454_s_400_70.jpg`)
-- The Lambda will always look for the original image with the `_original` suffix and generate resized images using the `_s_` separator.
-
----
-
-## CloudFront Setup & Caching Policies
-
-### 1. **CloudFront Origin and Behaviors**
-- **Origin:** S3 bucket containing your images.
-- **Behavior:**
-  - Path pattern: `assets/*` (or as needed)
-  - Origin: S3 bucket
-  - Viewer protocol policy: Redirect HTTP to HTTPS (recommended)
-  - Allowed HTTP methods: GET, HEAD
-  - **Cache policy:**
-    - Cache based on all query strings (if any)
-    - Cache based on all headers (if needed)
-    - Set TTLs as appropriate for your use case (e.g., min/max/default TTL)
-
-### 2. **Custom Error Response to API Gateway**
-- Configure CloudFront to handle 403/404 errors from S3:
-  - **Error code:** 403, 404
-  - **Response:** Redirect to your API Gateway endpoint (e.g., `/image/assets/23/2345454_s_400_70.jpg`)
-  - **HTTP response code:** 200 (or as required by your API Gateway setup)
-
-### 3. **Cache Invalidation When Original Image Changes**
-- If you upload a new version of an original image (e.g., `2345454_original.jpg`), you must invalidate all cached resized versions in CloudFront.
-- **Recommended approach:**
-  - Use the AWS CLI or Console to create an invalidation for the relevant resized image paths, e.g.:
-    ```bash
-    aws cloudfront create-invalidation --distribution-id <DISTRIBUTION_ID> --paths "/assets/23/2345454_s_*.jpg"
-    ```
-  - This will invalidate all resized versions for that image.
-- **Best practice:**
-  - Automate invalidation as part of your image upload/deployment pipeline if originals are updated frequently.
-  - Optionally, use versioning in the original filename (e.g., `2345454_v2_original.jpg`) to avoid cache issues and keep old versions available.
-
-### 4. **General Caching Tips**
-- Set long TTLs for resized images in CloudFront for best performance.
-- Invalidate only when the original changes to minimize cache churn and cost.
-- Ensure your Lambda returns appropriate cache headers (already set to `max-age=31536000, public`). 
+## License
+MIT 
