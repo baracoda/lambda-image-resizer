@@ -1,8 +1,9 @@
 """
 Lambda Image Resizer
 --------------------
-Resizes images on-demand for CloudFront/S3, using _original images as source.
+Resizes images on-demand for CloudFront/S3, using original images as source.
 Supports local (mock) and live (production) execution modes.
+Now parses width/height from filename (e.g., 2345454_s_400_70.jpg → 2345454.jpg, 400, 70).
 """
 
 import os
@@ -10,8 +11,9 @@ import boto3
 import io
 import logging
 from PIL import Image
-from urllib.parse import parse_qs, urlparse, unquote
+from urllib.parse import unquote
 import base64
+import re
 
 # Set up logging
 logger = logging.getLogger()
@@ -39,7 +41,7 @@ class ImageProcessingError(ImageResizerError):
 def lambda_handler(event, context):
     """
     AWS Lambda handler to resize images on-demand and serve via S3.
-    Expects event['queryStringParameters'] to contain 'w' and 'h'.
+    Expects the path to contain the filename with dimensions, e.g., 2345454_s_400_70.jpg
     Reads all configuration from environment variables.
     """
     # Read environment variables
@@ -47,6 +49,7 @@ def lambda_handler(event, context):
     s3_prefix = os.environ.get('S3_PREFIX', '')
     max_dimension = int(os.environ.get('MAX_DIMENSION', DEFAULT_MAX_DIMENSION))
     execution_mode = os.environ.get('EXECUTION_MODE', 'live').lower()
+    cloudfront_url = os.environ.get('CLOUDFRONT_URL', 'https://cdn.domain.com')
 
     if not bucket:
         logger.error('IMAGE_BUCKET environment variable not set.')
@@ -61,41 +64,45 @@ def lambda_handler(event, context):
     s3 = boto3.client('s3')
 
     try:
-        # Parse request
-        path, width, height = parse_request(event, max_dimension)
-        logger.info(f"Requested: {path} at {width}x{height}")
+        # Parse request path from event
+        path = parse_path_from_event(event)
+        logger.info(f"Requested path: {path}")
+
+        # Remove API Gateway prefix if present (e.g., /image/)
+        if path.startswith('image/'):
+            path = path[len('image/'):]
+
+        # Parse width, height, and original filename from the requested filename
+        s3_key_dir, filename, original_filename, width, height, ext = parse_filename_and_dimensions(path, max_dimension)
+        logger.info(f"Parsed: dir={s3_key_dir}, filename={filename}, original={original_filename}, width={width}, height={height}, ext={ext}")
 
         # Validate extension
-        ext = os.path.splitext(path)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             logger.warning(f"Unsupported file type requested: {ext}")
             return error_response(400, 'Unsupported file type. Allowed: .jpg, .jpeg, .png, .webp', error_type='ValidationError')
 
-        # Build S3 key for resized and original image
-        base, ext = os.path.splitext(path)
-        if s3_prefix and not base.startswith(s3_prefix):
-            base = f"{s3_prefix.rstrip('/')}/{base.lstrip('/')}"
-        resized_key = f"{base}_{width}_{height}{ext}"
-        original_key = f"{base}_original{ext}"
+        # S3 keys
+        resized_key = os.path.join(s3_key_dir, filename)
+        original_key = os.path.join(s3_key_dir, original_filename)
 
         # 1. Check if resized image exists
         try:
             if s3_key_exists(s3, bucket, resized_key):
                 logger.info(f"Resized image exists: {resized_key}")
-                return s3_image_response(s3, bucket, resized_key, ext)
+                return redirect_response(f"{cloudfront_url}/{resized_key}")
         except S3OperationError as e:
             logger.error(f"S3 error while checking resized image: {e}")
             return error_response(500, str(e), error_type='S3Error')
 
-        # 2. If not, fetch _original
+        # 2. If not, fetch original
         try:
             if not s3_key_exists(s3, bucket, original_key):
                 logger.warning(f"Original image not found: {original_key}")
-                return error_response(404, 'Original image not found. Please upload the _original image.', error_type='NotFound')
+                return error_response(404, 'Original image not found. Please upload the original image.', error_type='NotFound')
             orig_img_bytes = get_s3_object(s3, bucket, original_key)
         except S3KeyNotFoundError:
             logger.warning(f"Original image not found: {original_key}")
-            return error_response(404, 'Original image not found. Please upload the _original image.', error_type='NotFound')
+            return error_response(404, 'Original image not found. Please upload the original image.', error_type='NotFound')
         except S3OperationError as e:
             logger.error(f"S3 error while fetching original image: {e}")
             return error_response(500, str(e), error_type='S3Error')
@@ -117,8 +124,8 @@ def lambda_handler(event, context):
             logger.error(f"S3 error while storing resized image: {e}")
             return error_response(500, str(e), error_type='S3Error')
 
-        # 5. Return resized image
-        return image_response(resized_img_bytes, ext)
+        # 5. Return 301 redirect to CloudFront URL
+        return redirect_response(f"{cloudfront_url}/{resized_key}")
 
     except ValueError as ve:
         logger.warning(f"Input validation error: {ve}")
@@ -127,38 +134,50 @@ def lambda_handler(event, context):
         logger.exception("Unhandled error processing image request")
         return error_response(500, f"Internal error: {str(e)}", error_type='InternalError')
 
-def parse_request(event, max_dimension):
+def parse_path_from_event(event):
     """
-    Extracts image path, width, and height from the event.
-    Validates and returns (path, width, height).
+    Extracts the path from the event for API Gateway or Lambda@Edge.
     """
-    # For Lambda@Edge, path is in event['Records'][0]['cf']['request']['uri']
-    # For API Gateway, path is in event['path']
     if 'Records' in event:
         # Lambda@Edge
         cf_req = event['Records'][0]['cf']['request']
-        path = unquote(cf_req['uri'].lstrip('/'))
-        qs = parse_qs(cf_req.get('querystring', ''))
+        return unquote(cf_req['uri'].lstrip('/'))
     else:
         # API Gateway
-        path = unquote(event.get('path', '').lstrip('/'))
-        qs = event.get('queryStringParameters', {})
-    
-    # Get width and height
-    w = qs.get('w')
-    h = qs.get('h')
-    if isinstance(w, list):
-        w = w[0]
-    if isinstance(h, list):
-        h = h[0]
-    try:
-        width = int(w)
-        height = int(h)
-        if not (1 <= width <= max_dimension and 1 <= height <= max_dimension):
-            raise ValueError(f'Width and height must be between 1 and {max_dimension}.')
-    except Exception:
-        raise ValueError('Invalid width or height. Please provide integer values within allowed range.')
-    return path, width, height
+        return unquote(event.get('path', '').lstrip('/'))
+
+def parse_filename_and_dimensions(path, max_dimension):
+    """
+    Parses the directory, filename, original filename, width, height, and extension from the path.
+    Expects filename like: 2345454_s_400_70.jpg
+    Returns: (dir, filename, original_filename, width, height, ext)
+    """
+    dir_path, filename = os.path.split(path)
+    # Regex: <name>_s_<width>_<height>.<ext>
+    match = re.match(r"(.+)_s_(\d+)_(\d+)(\.[a-zA-Z0-9]+)$", filename)
+    if not match:
+        raise ValueError('Filename must be in the format <name>_s_<width>_<height>.<ext>')
+    name, width, height, ext = match.groups()
+    width = int(width)
+    height = int(height)
+    if not (1 <= width <= max_dimension and 1 <= height <= max_dimension):
+        raise ValueError(f'Width and height must be between 1 and {max_dimension}.')
+    # The original image is always <name>_original.<ext>
+    original_filename = f"{name}_original{ext}"
+    return dir_path, filename, original_filename, width, height, ext.lower()
+
+def redirect_response(location):
+    """
+    Return a 301 redirect response to the given location.
+    """
+    return {
+        'statusCode': 301,
+        'headers': {
+            'Location': location,
+            'Cache-Control': 'max-age=31536000, public',
+        },
+        'body': '',
+    }
 
 def s3_key_exists(s3, bucket, key):
     """

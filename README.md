@@ -1,6 +1,81 @@
 # Lambda Image Resizer
 
-A secure, on-demand image resizing AWS Lambda function for use with CloudFront and S3. When invoked with an image path and width/height query parameters, it checks for a resized image in S3, generates and stores it if missing, and returns the image.
+---
+
+## How the Flow Works (CloudFront + Lambda Explainer)
+
+This solution enables on-demand image resizing and efficient CDN caching using AWS CloudFront, S3, and Lambda. Here's how the flow works:
+
+1. **Client requests a resized image**
+   - Example: `GET https://cdn.domain.com/assets/23/2345454_s_400_70.jpg`
+
+2. **CloudFront checks its cache**
+   - If the image is cached, it is returned immediately.
+   - If not cached, CloudFront forwards the request to the S3 origin.
+
+3. **S3 origin lookup**
+   - If `assets/23/2345454_s_400_70.jpg` exists in S3, it is returned to CloudFront and cached for future requests.
+   - If it does **not** exist, S3 returns a 403/404 error.
+
+4. **CloudFront custom error response**
+   - CloudFront is configured to redirect 403/404 errors to an API Gateway endpoint (e.g., `/image/assets/23/2345454_s_400_70.jpg`), which triggers the Lambda resizer.
+
+5. **Lambda resizer logic**
+   - Lambda parses the request path and extracts:
+     - Directory: `assets/23/`
+     - Filename: `2345454_s_400_70.jpg`
+     - Original image: `2345454_original.jpg`
+     - Width: `400`, Height: `70`
+   - Lambda checks if the original image exists in S3.
+     - If not, returns a 404 error.
+   - If found, Lambda resizes the image using Pillow, saves the new file as `2345454_s_400_70.jpg` in S3, and returns a **301 redirect** to the CloudFront URL for the resized image.
+
+6. **Client follows the redirect**
+   - The client/browser automatically follows the redirect to the CloudFront URL, which now serves the newly generated and cached image.
+
+**Result:**
+- The first request for a new size triggers Lambda to generate and store the image.
+- All subsequent requests are served instantly from CloudFront's cache.
+- If the original image changes, you can invalidate the cached resized images in CloudFront.
+
+---
+
+## CloudFront Setup & Caching Policies
+
+### 1. **CloudFront Origin and Behaviors**
+- **Origin:** S3 bucket containing your images.
+- **Behavior:**
+  - Path pattern: `assets/*` (or as needed)
+  - Origin: S3 bucket
+  - Viewer protocol policy: Redirect HTTP to HTTPS (recommended)
+  - Allowed HTTP methods: GET, HEAD
+  - **Cache policy:**
+    - Cache based on all query strings (if any)
+    - Cache based on all headers (if needed)
+    - Set TTLs as appropriate for your use case (e.g., min/max/default TTL)
+
+### 2. **Custom Error Response to API Gateway**
+- Configure CloudFront to handle 403/404 errors from S3:
+  - **Error code:** 403, 404
+  - **Response:** Redirect to your API Gateway endpoint (e.g., `/image/assets/23/2345454_s_400_70.jpg`)
+  - **HTTP response code:** 200 (or as required by your API Gateway setup)
+
+### 3. **Cache Invalidation When Original Image Changes**
+- If you upload a new version of an original image (e.g., `2345454_original.jpg`), you must invalidate all cached resized versions in CloudFront.
+- **Recommended approach:**
+  - Use the AWS CLI or Console to create an invalidation for the relevant resized image paths, e.g.:
+    ```bash
+    aws cloudfront create-invalidation --distribution-id <DISTRIBUTION_ID> --paths "/assets/23/2345454_s_*.jpg"
+    ```
+  - This will invalidate all resized versions for that image.
+- **Best practice:**
+  - Automate invalidation as part of your image upload/deployment pipeline if originals are updated frequently.
+  - Optionally, use versioning in the original filename (e.g., `2345454_v2_original.jpg`) to avoid cache issues and keep old versions available.
+
+### 4. **General Caching Tips**
+- Set long TTLs for resized images in CloudFront for best performance.
+- Invalidate only when the original changes to minimize cache churn and cost.
+- Ensure your Lambda returns appropriate cache headers (already set to `max-age=31536000, public`).
 
 ---
 
@@ -226,3 +301,50 @@ MIT
 
 4. **Verify your deployment package:**
    - Ensure `moto`, `pytest`, and other test-only libraries are **not** present in your deployment zip or Lambda Layer. 
+
+---
+
+## Filename Conventions
+
+- **Original images:** `<name>_original.<ext>` (e.g., `2345454_original.jpg`)
+- **Resized images:** `<name>_s_<width>_<height>.<ext>` (e.g., `2345454_s_400_70.jpg`)
+- The Lambda will always look for the original image with the `_original` suffix and generate resized images using the `_s_` separator.
+
+---
+
+## CloudFront Setup & Caching Policies
+
+### 1. **CloudFront Origin and Behaviors**
+- **Origin:** S3 bucket containing your images.
+- **Behavior:**
+  - Path pattern: `assets/*` (or as needed)
+  - Origin: S3 bucket
+  - Viewer protocol policy: Redirect HTTP to HTTPS (recommended)
+  - Allowed HTTP methods: GET, HEAD
+  - **Cache policy:**
+    - Cache based on all query strings (if any)
+    - Cache based on all headers (if needed)
+    - Set TTLs as appropriate for your use case (e.g., min/max/default TTL)
+
+### 2. **Custom Error Response to API Gateway**
+- Configure CloudFront to handle 403/404 errors from S3:
+  - **Error code:** 403, 404
+  - **Response:** Redirect to your API Gateway endpoint (e.g., `/image/assets/23/2345454_s_400_70.jpg`)
+  - **HTTP response code:** 200 (or as required by your API Gateway setup)
+
+### 3. **Cache Invalidation When Original Image Changes**
+- If you upload a new version of an original image (e.g., `2345454_original.jpg`), you must invalidate all cached resized versions in CloudFront.
+- **Recommended approach:**
+  - Use the AWS CLI or Console to create an invalidation for the relevant resized image paths, e.g.:
+    ```bash
+    aws cloudfront create-invalidation --distribution-id <DISTRIBUTION_ID> --paths "/assets/23/2345454_s_*.jpg"
+    ```
+  - This will invalidate all resized versions for that image.
+- **Best practice:**
+  - Automate invalidation as part of your image upload/deployment pipeline if originals are updated frequently.
+  - Optionally, use versioning in the original filename (e.g., `2345454_v2_original.jpg`) to avoid cache issues and keep old versions available.
+
+### 4. **General Caching Tips**
+- Set long TTLs for resized images in CloudFront for best performance.
+- Invalidate only when the original changes to minimize cache churn and cost.
+- Ensure your Lambda returns appropriate cache headers (already set to `max-age=31536000, public`). 

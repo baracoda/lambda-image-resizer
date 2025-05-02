@@ -22,6 +22,7 @@ def skip_if_live_mode():
 @pytest.fixture(autouse=True)
 def setup_env(monkeypatch):
     monkeypatch.setenv('IMAGE_BUCKET', BUCKET)
+    monkeypatch.setenv('CLOUDFRONT_URL', 'https://cdn.domain.com')
 
 @mock_aws
 def test_valid_resize_and_return():
@@ -34,23 +35,18 @@ def test_valid_resize_and_return():
     s3.put_object(Bucket=BUCKET, Key='assets/image_original.jpg', Body=buf.getvalue())
 
     event = {
-        'path': '/assets/image.jpg',
-        'queryStringParameters': {'w': '100', 'h': '50'}
+        'path': '/assets/image_s_100_50.jpg',
     }
     resp = lambda_handler(event, None)
-    assert resp['statusCode'] == 200
-    assert resp['isBase64Encoded']
-    img_bytes = base64.b64decode(resp['body'])
-    out_img = Image.open(io.BytesIO(img_bytes))
-    assert out_img.size == (100, 50)
+    assert resp['statusCode'] == 301
+    assert resp['headers']['Location'] == 'https://cdn.domain.com/assets/image_s_100_50.jpg'
 
 @mock_aws
 def test_missing_original_image():
     s3 = boto3.client('s3')
     s3.create_bucket(Bucket=BUCKET)
     event = {
-        'path': '/assets/missing.jpg',
-        'queryStringParameters': {'w': '100', 'h': '50'}
+        'path': '/assets/missing_s_100_50.jpg',
     }
     resp = lambda_handler(event, None)
     assert resp['statusCode'] == 404
@@ -61,19 +57,18 @@ def test_invalid_parameters():
     s3 = boto3.client('s3')
     s3.create_bucket(Bucket=BUCKET)
     event = {
-        'path': '/assets/image.jpg',
-        'queryStringParameters': {'w': '0', 'h': '9999'}
+        'path': '/assets/image_s_0_9999.jpg',
     }
     resp = lambda_handler(event, None)
     assert resp['statusCode'] == 400
+    assert 'Width and height must be between' in resp['body']
 
 @mock_aws
 def test_unsupported_file_type():
     s3 = boto3.client('s3')
     s3.create_bucket(Bucket=BUCKET)
     event = {
-        'path': '/assets/image.bmp',
-        'queryStringParameters': {'w': '100', 'h': '50'}
+        'path': '/assets/image_s_100_50.bmp',
     }
     resp = lambda_handler(event, None)
     assert resp['statusCode'] == 400
